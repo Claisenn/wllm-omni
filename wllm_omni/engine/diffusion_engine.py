@@ -9,8 +9,10 @@ class DiffusionEngine:
 
     def __init__(self, config: EngineConfig):
         self.config = config
-        # The current diffusion executor still runs one request per forward batch.
-        self.scheduler = StepScheduler(max_num_running_reqs=1)
+        # Concurrency comes from the config now that the executor batches. How
+        # many of these actually run together is still decided by the scheduler:
+        # only requests sharing a StepBatchSamplingParamsKey join one batch.
+        self.scheduler = StepScheduler(max_num_running_reqs=config.max_num_seqs)
         self.runner = ModelRunner(config)
 
     def generate(self, requests: OmniRequest | list[OmniRequest]) -> list[OmniOutput]:

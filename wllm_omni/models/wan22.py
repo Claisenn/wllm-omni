@@ -14,6 +14,7 @@ from wllm_omni.config import EngineConfig
 from wllm_omni.outputs import OmniOutput
 from wllm_omni.profiler import RequestProfiler
 from wllm_omni.utils import resize_with_aspect
+from wllm_omni.worker.input_batch import StepInputBatch
 from wllm_omni.worker.utils import RunnerState
 
 
@@ -156,8 +157,8 @@ class Wan22I2VPipeline:
             num_frames = num_frames // temporal_factor * temporal_factor + 1
         return max(num_frames, 1)
 
-    def _ensure_scheduler_on_device(self, device: torch.device) -> None:
-        scheduler = self.pipe.scheduler
+    @staticmethod
+    def _ensure_scheduler_on_device(scheduler, device: torch.device) -> None:
         for attr in ("sigmas", "timesteps", "last_sample"):
             value = getattr(scheduler, attr, None)
             if isinstance(value, torch.Tensor):
@@ -195,7 +196,9 @@ class Wan22I2VPipeline:
             "config_vae_dtype": self._dtype_name(self.config.vae_dtype),
             "transformer_dtype": self._dtype_name(getattr(pipe.transformer, "dtype", None)),
             "vae_dtype": self._dtype_name(getattr(pipe.vae, "dtype", None)),
-            "scheduler": pipe.scheduler.__class__.__name__,
+            # Reports the class instantiated per request, not pipe.scheduler,
+            # which is left at its from_pretrained default and never stepped.
+            "scheduler": UniPCMultistepScheduler.__name__,
         }
 
     def profile_stage(self, state: RunnerState, name: str):
@@ -422,7 +425,15 @@ class Wan22I2VPipeline:
         device = pipe._execution_device
 
         with self.profile_stage(state, "prepare.scheduler_config"):
-            pipe.scheduler = UniPCMultistepScheduler.from_config(
+            # Each request owns its scheduler instance rather than mutating the
+            # pipeline's. UniPCMultistepScheduler is a multistep solver: it keeps
+            # a model_outputs history and an internal step index sized for
+            # whatever it last saw. One shared instance would make batched
+            # requests overwrite each other's history, and would make it
+            # impossible to admit a request into a batch already in flight.
+            # (vLLM-Omni sidesteps this by shipping its own first-order
+            # WanEulerScheduler, whose entire state is sigmas plus a step index.)
+            state.scheduler = UniPCMultistepScheduler.from_config(
                 pipe.scheduler.config,
                 flow_shift=sampling.flow_shift,
             )
@@ -454,38 +465,43 @@ class Wan22I2VPipeline:
             self._clone_prepare_tensors(state, condition_bundle.latents)
 
         with self.profile_stage(state, "prepare.timesteps"):
-            pipe.scheduler.set_timesteps(sampling.num_inference_steps, device=device)
-            self._ensure_scheduler_on_device(device)
-            state.timesteps = pipe.scheduler.timesteps
-            pipe.scheduler.set_begin_index(0)
+            state.scheduler.set_timesteps(sampling.num_inference_steps, device=device)
+            self._ensure_scheduler_on_device(state.scheduler, device)
+            state.timesteps = state.scheduler.timesteps
+            state.scheduler.set_begin_index(0)
         state.step_index = 0
         return state
 
-    def _prepare_denoise_inputs(self, state: RunnerState) -> WanDenoiseInputs:
+    def _prepare_denoise_inputs(self, batch: StepInputBatch) -> WanDenoiseInputs:
         pipe = self.pipe
-        latents = state.latents
+        latents = batch.latents
         device = latents.device
-        t = state.timesteps[state.step_index].to(device)
-        condition = state.extra["condition"].to(device)
-        first_frame_mask = state.extra.get("first_frame_mask")
+        t = batch.timesteps.to(device)
+        condition = batch.condition.to(device)
+        first_frame_mask = batch.first_frame_mask
         if first_frame_mask is not None:
             first_frame_mask = first_frame_mask.to(device)
-        guidance_scale = state.extra["guidance_scale"]
+        guidance_scale = batch.guidance_scale
         transformer_dtype = pipe.transformer.dtype
-        prompt_embeds = state.prompt_embeds.to(device)
-        negative_prompt_embeds = None if state.negative_prompt_embeds is None else state.negative_prompt_embeds.to(device)
+        prompt_embeds = batch.prompt_embeds.to(device)
+        negative_prompt_embeds = None if batch.negative_prompt_embeds is None else batch.negative_prompt_embeds.to(device)
 
         if pipe.config.expand_timesteps:
             latent_model_input = (1 - first_frame_mask) * condition + first_frame_mask * latents
             latent_model_input = latent_model_input.to(transformer_dtype)
-            temp_ts = (first_frame_mask[0][0][:, ::2, ::2] * t).flatten()
-            timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
+            # Patch-level timesteps are per request: each row combines that
+            # request's own mask with its own current timestep, which is what
+            # allows requests at different progress to share the batch.
+            timestep = torch.stack(
+                [(first_frame_mask[index][0][:, ::2, ::2] * t[index]).flatten() for index in range(t.shape[0])]
+            )
         else:
             latent_model_input = torch.cat([latents, condition], dim=1).to(transformer_dtype)
-            timestep = t.expand(latents.shape[0])
+            timestep = t
 
-        state.extra["denoise_latent_model_input_shape"] = self._shape_text(latent_model_input)
-        state.extra["denoise_timestep_shape"] = self._shape_text(timestep)
+        for state in batch.states:
+            state.extra["denoise_latent_model_input_shape"] = self._shape_text(latent_model_input)
+            state.extra["denoise_timestep_shape"] = self._shape_text(timestep)
         return WanDenoiseInputs(
             latent_model_input=latent_model_input,
             timestep=timestep,
@@ -517,32 +533,41 @@ class Wan22I2VPipeline:
     ) -> torch.Tensor:
         return noise_uncond + guidance_scale * (noise_pred - noise_uncond)
 
-    def denoise_step(self, state: RunnerState) -> torch.Tensor:
-        with self.profile_stage(state, "denoise.prepare_inputs"):
-            inputs = self._prepare_denoise_inputs(state)
+    def denoise_step(self, batch: StepInputBatch) -> torch.Tensor:
+        """Run one denoise step for the whole batch with a single DiT forward."""
+        anchor = batch.states[0]
+        with self.profile_stage(anchor, "denoise.prepare_inputs"):
+            inputs = self._prepare_denoise_inputs(batch)
 
-        with self.profile_stage(state, "denoise.transformer_cond"):
+        with self.profile_stage(anchor, "denoise.transformer_cond"):
             noise_pred = self._run_transformer_forward(inputs, inputs.prompt_embeds, "cond")
 
         if inputs.guidance_scale > 1.0:
-            with self.profile_stage(state, "denoise.transformer_uncond"):
+            with self.profile_stage(anchor, "denoise.transformer_uncond"):
                 noise_uncond = self._run_transformer_forward(inputs, inputs.negative_prompt_embeds, "uncond")
-            with self.profile_stage(state, "denoise.cfg_combine"):
+            with self.profile_stage(anchor, "denoise.cfg_combine"):
                 noise_pred = self._apply_classifier_free_guidance(noise_pred, noise_uncond, inputs.guidance_scale)
 
         return noise_pred
 
-    def step_scheduler(self, state: RunnerState, noise_pred: torch.Tensor) -> None:
-        with self.profile_stage(state, "scheduler.ensure_device"):
-            device = state.latents.device
-            self._ensure_scheduler_on_device(device)
-            t = state.timesteps[state.step_index].to(device)
-            noise_pred = noise_pred.to(device)
-        with self.profile_stage(state, "scheduler.step_core"):
-            latents = self.pipe.scheduler.step(noise_pred, t, state.latents, return_dict=False)[0]
-        with self.profile_stage(state, "scheduler.clone_latents"):
-            state.latents = self._clone_tensor(latents)
-            state.step_index += 1
+    def step_scheduler(self, batch: StepInputBatch, noise_pred: torch.Tensor) -> None:
+        """Advance each request through its own scheduler and write latents back.
+
+        Only the transformer forward is batched. The solver update stays a
+        per-request loop because each request owns its scheduler state; it is
+        cheap elementwise math next to the DiT forward, so keeping it serial
+        costs little and buys independent progress per request.
+        """
+        anchor = batch.states[0]
+        with self.profile_stage(anchor, "scheduler.step_core"):
+            for index, state in enumerate(batch.states):
+                device = state.latents.device
+                self._ensure_scheduler_on_device(state.scheduler, device)
+                t = state.timesteps[state.step_index].to(device)
+                request_noise = batch.slice_for(index, noise_pred).to(device)
+                latents = state.scheduler.step(request_noise, t, state.latents, return_dict=False)[0]
+                state.latents = self._clone_tensor(latents)
+                state.step_index += 1
 
     def post_decode(self, state: RunnerState) -> OmniOutput:
         pipe = self.pipe
@@ -579,5 +604,5 @@ class Wan22I2VPipeline:
             width=width,
             height=height,
             fps=state.sampling.fps,
-            scheduler=self.pipe.scheduler.__class__.__name__,
+            scheduler=state.scheduler.__class__.__name__,
         )

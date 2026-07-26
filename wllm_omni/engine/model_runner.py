@@ -61,24 +61,6 @@ class ModelRunner:
         self._release_finished_outputs(outputs)
         return RunnerBatchOutput(outputs=outputs)
 
-    def execute_stepwise(self, scheduler_output: SchedulerOutput) -> RunnerOutput:
-        """Compatibility shim for the current single-request scheduler."""
-
-        batch_output = self.execute(scheduler_output)
-        if scheduler_output.num_scheduled_reqs != 1:
-            if batch_output.outputs:
-                return batch_output.outputs[0]
-            return RunnerOutput(
-                req_id="unknown",
-                finished=True,
-                error=(
-                    "wllm-omni step execution currently supports exactly one scheduled request, "
-                    f"got {scheduler_output.num_scheduled_reqs}."
-                ),
-            )
-        return batch_output.to_single()
-
-
     @staticmethod
     def _no_grad_context():
         try:

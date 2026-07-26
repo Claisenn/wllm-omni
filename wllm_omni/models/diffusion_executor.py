@@ -10,6 +10,7 @@ from wllm_omni.models import ModelExecutor, supports_step_execution
 from wllm_omni.profiler import RequestProfiler
 from wllm_omni.request import OmniRequest
 from wllm_omni.sched.interface import StepBatchSamplingParamsKey
+from wllm_omni.worker.input_batch import StepInputBatch
 from wllm_omni.worker.utils import (
     ExecutionPhase,
     ExecutorCapability,
@@ -73,59 +74,68 @@ class DiffusionExecutor(ModelExecutor):
         return (self.paradigm.value, StepBatchSamplingParamsKey.from_sampling_params(self._payload(state).sampling))
 
     def build_forward_batch(self, states: list[RequestState]) -> ForwardBatch:
-        if len(states) != 1:
-            raise ValueError(f"DiffusionExecutor V1 supports exactly one request per forward batch, got {len(states)}.")
-        state = states[0]
-        payload = self._payload(state)
-        phase = ExecutionPhase.PREPARE if not state.initialized else ExecutionPhase.STEP
-        if payload.denoise_completed:
-            phase = ExecutionPhase.FINALIZE
-        return ForwardBatch(paradigm=self.paradigm, req_ids=[state.sched_req_id], phase=phase, payload=payload)
+        payloads = [self._payload(state) for state in states]
+        return ForwardBatch(
+            paradigm=self.paradigm,
+            req_ids=[state.sched_req_id for state in states],
+            phase=self._batch_phase(states, payloads),
+            payload=payloads,
+        )
+
+    @staticmethod
+    def _batch_phase(states: list[RequestState], payloads: list[RunnerState]) -> ExecutionPhase:
+        """Summarise what the batch is about to do.
+
+        A batch may be mixed: a request admitted this round still needs encoding
+        while the others are mid-denoise. The phase reports the earliest work in
+        the batch, and is metadata only -- forward() dispatches per request.
+        """
+        if any(not state.initialized for state in states):
+            return ExecutionPhase.PREPARE
+        if all(payload.denoise_completed for payload in payloads):
+            return ExecutionPhase.FINALIZE
+        return ExecutionPhase.STEP
 
     def forward(self, batch: ForwardBatch) -> ModelForwardOutput:
         if batch.paradigm != self.paradigm:
             raise ValueError(f"DiffusionExecutor cannot run batch for paradigm={batch.paradigm}.")
-        if len(batch.req_ids) != 1:
-            raise ValueError(f"DiffusionExecutor V1 supports exactly one request per forward batch, got {len(batch.req_ids)}.")
 
-        payload = self._batch_payload(batch)
-        profile = self._profiler(payload)
-        output: ModelForwardOutput
-        with self._profile_stage(payload, "forward.total"):
-            if batch.phase == ExecutionPhase.PREPARE:
-                with self._profile_stage(payload, "forward.prepare_encode"):
-                    payload = self.pipeline.prepare_encode(payload)
+        payloads = self._batch_payloads(batch)
+        anchor = payloads[0]
+        outputs: list[RunnerOutput] = []
+        with self._profile_stage(anchor, "forward.total"):
+            # Requests joining the batch this round are encoded first, one at a
+            # time: prepare_encode is per-request work (image preprocessing, VAE
+            # encode, prompt encode) and each hits its own caches.
+            for payload in payloads:
+                if payload.timesteps is None:
+                    with self._profile_stage(payload, "forward.prepare_encode"):
+                        self.pipeline.prepare_encode(payload)
 
-            if not payload.denoise_completed:
-                with self._profile_stage(payload, "forward.denoise_step"):
-                    noise_pred = self.pipeline.denoise_step(payload)
-                with self._profile_stage(payload, "forward.step_scheduler"):
-                    self.pipeline.step_scheduler(payload, noise_pred)
+            active = [payload for payload in payloads if not payload.denoise_completed]
+            if active:
+                input_batch = StepInputBatch.make_batch(active)
+                with self._profile_stage(anchor, "forward.denoise_step"):
+                    noise_pred = self.pipeline.denoise_step(input_batch)
+                with self._profile_stage(anchor, "forward.step_scheduler"):
+                    self.pipeline.step_scheduler(input_batch, noise_pred)
 
-            req_id = batch.req_ids[0]
-            if payload.denoise_completed:
+            # Requests reaching their last step decode and finish independently;
+            # the rest stay in the batch for the next round.
+            for req_id, payload in zip(batch.req_ids, payloads, strict=True):
+                if not payload.denoise_completed:
+                    outputs.append(RunnerOutput(req_id=req_id, step_index=payload.step_index, finished=False))
+                    continue
                 with self._profile_stage(payload, "forward.post_decode"):
                     result = self.pipeline.post_decode(payload)
-                output = ModelForwardOutput(
-                    outputs=[
-                        RunnerOutput(
-                            req_id=req_id,
-                            step_index=payload.step_index,
-                            finished=True,
-                            result=result,
-                        )
-                    ],
-                    payload=payload,
-                )
-            else:
-                output = ModelForwardOutput(
-                    outputs=[RunnerOutput(req_id=req_id, step_index=payload.step_index, finished=False)],
-                    payload=payload,
+                outputs.append(
+                    RunnerOutput(req_id=req_id, step_index=payload.step_index, finished=True, result=result)
                 )
 
-        if profile is not None and payload.denoise_completed:
-            self._emit_profile(payload)
-        return output
+        for payload in payloads:
+            if payload.denoise_completed and self._profiler(payload) is not None:
+                self._emit_profile(payload)
+        return ModelForwardOutput(outputs=outputs, payload=payloads)
 
     def update_states(self, states: list[RequestState], output: ModelForwardOutput) -> None:
         output_by_req_id = {item.req_id: item for item in output.outputs}
@@ -133,9 +143,7 @@ class DiffusionExecutor(ModelExecutor):
             item = output_by_req_id.get(state.sched_req_id)
             if item is None:
                 continue
-            if output.payload is not None:
-                state.payload = output.payload
-                state.initialized = True
+            state.initialized = True
             if item.error is not None:
                 state.error = item.error
                 state.finished = True
@@ -161,9 +169,12 @@ class DiffusionExecutor(ModelExecutor):
         return state.payload
 
     @staticmethod
-    def _batch_payload(batch: ForwardBatch) -> RunnerState:
-        if not isinstance(batch.payload, RunnerState):
-            raise TypeError(f"Expected RunnerState batch payload, got {type(batch.payload).__name__}.")
+    def _batch_payloads(batch: ForwardBatch) -> list[RunnerState]:
+        if not isinstance(batch.payload, list) or not batch.payload:
+            raise TypeError(f"Expected a non-empty RunnerState list payload, got {type(batch.payload).__name__}.")
+        for item in batch.payload:
+            if not isinstance(item, RunnerState):
+                raise TypeError(f"Expected RunnerState payload item, got {type(item).__name__}.")
         return batch.payload
 
     def _profile_stage(self, state: RunnerState, name: str):
