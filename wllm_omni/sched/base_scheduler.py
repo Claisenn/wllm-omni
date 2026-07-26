@@ -9,6 +9,7 @@ from wllm_omni.sched.interface import (
     SchedulerInterface,
     SchedulerOutput,
     SchedulerRequestState,
+    StepBatchSamplingParamsKey,
 )
 
 
@@ -21,15 +22,46 @@ class BaseScheduler(SchedulerInterface):
         self._waiting: deque[str] = deque()
         self._running: list[str] = []
         self._finished_req_ids: set[str] = set()
+        self._running_sampling_params_key: StepBatchSamplingParamsKey | None = None
         self.max_num_running_reqs = max_num_running_reqs
 
     def add_request(self, request: OmniRequest) -> str:
         sched_req_id = self._make_sched_req_id(request)
-        state = SchedulerRequestState(sched_req_id=sched_req_id, req=request)
+        state = self._make_request_state(sched_req_id, request)
         self._request_states[sched_req_id] = state
         self._request_id_to_sched_req_id[request.request_id] = sched_req_id
         self._waiting.append(sched_req_id)
         return sched_req_id
+
+    def _make_request_state(self, sched_req_id: str, request: OmniRequest) -> SchedulerRequestState:
+        return SchedulerRequestState(
+            sched_req_id=sched_req_id,
+            req=request,
+            sampling_params_key=self._build_sampling_params_key(request),
+        )
+
+    @staticmethod
+    def _build_sampling_params_key(request: OmniRequest) -> StepBatchSamplingParamsKey:
+        return StepBatchSamplingParamsKey.from_sampling_params(request.sampling_params)
+
+    def _can_schedule_waiting(self, state: SchedulerRequestState) -> bool:
+        """Admit a waiting request only if it can share a batch with the running set.
+
+        Homogeneous batching: rather than padding heterogeneous requests to a
+        common shape, the scheduler only groups requests that are already
+        compatible and leaves the rest queued for a later batch.
+        """
+        if not self._running:
+            return True
+        current_key = self._current_sampling_params_key()
+        return current_key is not None and current_key == state.sampling_params_key
+
+    def _current_sampling_params_key(self) -> StepBatchSamplingParamsKey | None:
+        if self._running_sampling_params_key is not None or not self._running:
+            return self._running_sampling_params_key
+        state = self._request_states.get(self._running[0])
+        self._running_sampling_params_key = None if state is None else state.sampling_params_key
+        return self._running_sampling_params_key
 
     def schedule(self) -> SchedulerOutput:
         scheduled_reqs: list[ScheduledRequest] = []
@@ -45,8 +77,12 @@ class BaseScheduler(SchedulerInterface):
             if state is None:
                 self._waiting.popleft()
                 continue
+            if not self._can_schedule_waiting(state):
+                break
             self._waiting.popleft()
             was_new = state.status == RequestStatus.WAITING
+            if not self._running:
+                self._running_sampling_params_key = state.sampling_params_key
             state.status = RequestStatus.RUNNING
             self._running.append(sched_req_id)
             scheduled_reqs.append(ScheduledRequest.from_state(state, is_new=was_new))
@@ -84,8 +120,15 @@ class BaseScheduler(SchedulerInterface):
             self._running.remove(sched_req_id)
             self._waiting.appendleft(sched_req_id)
             self._request_states[sched_req_id].status = RequestStatus.PREEMPTED
+            self._reset_key_if_idle()
             return True
         return False
+
+    def _reset_key_if_idle(self) -> None:
+        """Release the batch key once no request is running, so the next
+        scheduling round is free to start a batch with different parameters."""
+        if not self._running:
+            self._running_sampling_params_key = None
 
     def finish_requests(self, sched_req_ids: str | list[str], status: RequestStatus) -> None:
         assert RequestStatus.is_finished(status)
@@ -100,6 +143,7 @@ class BaseScheduler(SchedulerInterface):
         self._waiting.clear()
         self._running.clear()
         self._finished_req_ids.clear()
+        self._running_sampling_params_key = None
 
     def _finish_requests(
         self,
@@ -122,6 +166,7 @@ class BaseScheduler(SchedulerInterface):
                 waiting_to_remove.add(sched_req_id)
         if running_to_remove:
             self._running = [req_id for req_id in self._running if req_id not in running_to_remove]
+            self._reset_key_if_idle()
         if waiting_to_remove:
             self._waiting = deque(req_id for req_id in self._waiting if req_id not in waiting_to_remove)
         for sched_req_id in finished_req_ids:

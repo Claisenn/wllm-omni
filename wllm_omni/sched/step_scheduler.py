@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from wllm_omni.request import OmniRequest
 from wllm_omni.sched.base_scheduler import BaseScheduler
-from wllm_omni.sched.interface import RequestStatus, SchedulerOutput, SchedulerRequestState
+from wllm_omni.sched.interface import RequestStatus, SchedulerOutput
 from wllm_omni.worker.utils import RunnerBatchOutput, RunnerOutput
 
 
@@ -25,10 +25,7 @@ class StepScheduler(BaseScheduler):
         total_steps = int(request.sampling_params.num_inference_steps)
         if total_steps <= 0:
             raise ValueError(f"Request {sched_req_id} must have positive num_inference_steps, got {total_steps}")
-        self._request_states[sched_req_id] = SchedulerRequestState(
-            sched_req_id=sched_req_id,
-            req=request,
-        )
+        self._request_states[sched_req_id] = self._make_request_state(sched_req_id, request)
         self._request_id_to_sched_req_id[request.request_id] = sched_req_id
         self._waiting.append(sched_req_id)
         self._request_progress[sched_req_id] = _StepProgress(current_step=0, total_steps=total_steps)

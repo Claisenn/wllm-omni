@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from typing import TYPE_CHECKING
 
 import torch
 
 from wllm_omni.model_types import ModelParadigm
 from wllm_omni.models import ModelExecutor, supports_step_execution
-from wllm_omni.models.wan22 import Wan22I2VPipeline
 from wllm_omni.profiler import RequestProfiler
 from wllm_omni.request import OmniRequest
+from wllm_omni.sched.interface import StepBatchSamplingParamsKey
 from wllm_omni.worker.utils import (
     ExecutionPhase,
     ExecutorCapability,
@@ -18,6 +19,9 @@ from wllm_omni.worker.utils import (
     RunnerOutput,
     RunnerState,
 )
+
+if TYPE_CHECKING:
+    from wllm_omni.models.wan22 import Wan22I2VPipeline
 
 
 class DiffusionExecutor(ModelExecutor):
@@ -34,7 +38,7 @@ class DiffusionExecutor(ModelExecutor):
         ExecutorCapability.MULTIMODAL_INPUT,
     })
 
-    def __init__(self, pipeline: Wan22I2VPipeline):
+    def __init__(self, pipeline: "Wan22I2VPipeline"):
         self.pipeline = pipeline
         if not supports_step_execution(self.pipeline):
             raise TypeError(f"{self.pipeline.__class__.__name__} does not implement the step execution contract.")
@@ -57,21 +61,16 @@ class DiffusionExecutor(ModelExecutor):
         )
 
     def batch_key(self, state: RequestState) -> tuple:
-        payload = self._payload(state)
-        sampling = payload.sampling
-        return (
-            self.paradigm.value,
-            sampling.height,
-            sampling.width,
-            sampling.num_frames,
-            sampling.num_inference_steps,
-            sampling.guidance_scale,
-            sampling.flow_shift,
-            sampling.negative_prompt,
-            sampling.fps,
-            payload.step_index,
-            state.sched_req_id,
-        )
+        """Group states that may share one forward batch.
+
+        ``ModelRunner._group_states`` groups by this key, so anything
+        request-local in here makes batching structurally impossible: the key
+        used to carry ``sched_req_id`` and ``step_index``, which guaranteed that
+        every request landed in a group of its own. The key now carries exactly
+        the batch-compatibility fields, and reuses the scheduler's
+        ``StepBatchSamplingParamsKey`` so the two layers cannot drift apart.
+        """
+        return (self.paradigm.value, StepBatchSamplingParamsKey.from_sampling_params(self._payload(state).sampling))
 
     def build_forward_batch(self, states: list[RequestState]) -> ForwardBatch:
         if len(states) != 1:

@@ -3,11 +3,12 @@ from __future__ import annotations
 import enum
 import uuid
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from wllm_omni.request import OmniRequest
+    from wllm_omni.sampling_params import OmniSamplingParams
 
 
 class RequestStatus(enum.IntEnum):
@@ -23,10 +24,49 @@ class RequestStatus(enum.IntEnum):
         return status >= RequestStatus.FINISHED_COMPLETED
 
 
+@dataclass(frozen=True, slots=True)
+class StepBatchSamplingParamsKey:
+    """Denoise-step batch-compatibility key derived from OmniSamplingParams.
+
+    Only requests with an equal key may share a denoise-step batch. A field
+    belongs here if it changes the shape of the batched tensors or the operators
+    the batch executes; everything else is request-local and must not split a
+    batch. Concretely, ``seed`` only picks the initial noise (sampled per request
+    and then stacked) and ``negative_prompt`` only changes the contents of a
+    fixed-length embedding, so neither participates.
+
+    ``num_inference_steps`` is request-local upstream, because each request
+    carries its own timestep schedule. Here it is part of the key because
+    ``Wan22I2VPipeline.prepare_encode`` calls ``set_timesteps`` on the single
+    scheduler instance shared by the whole pipeline: two requests with different
+    step counts would overwrite each other's schedule.
+
+    Mirrors ``vllm_omni.diffusion.sched.interface.StepBatchSamplingParamsKey``.
+    """
+
+    # Spatial / temporal shape.
+    height: int
+    width: int
+    num_frames: int
+    fps: int
+
+    # CFG / guidance. Applied batch-wide by the current diffusion executor.
+    guidance_scale: float
+
+    # Scheduler configuration shared across the batch.
+    flow_shift: float
+    num_inference_steps: int
+
+    @classmethod
+    def from_sampling_params(cls, sampling_params: OmniSamplingParams) -> "StepBatchSamplingParamsKey":
+        return cls(**{field.name: getattr(sampling_params, field.name) for field in fields(cls)})
+
+
 @dataclass(slots=True)
 class SchedulerRequestState:
     sched_req_id: str
     req: OmniRequest
+    sampling_params_key: StepBatchSamplingParamsKey | None = None
     status: RequestStatus = RequestStatus.WAITING
     error: str | None = None
 

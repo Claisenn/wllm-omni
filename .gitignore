@@ -170,3 +170,4 @@ cython_debug/
 
 # Python pickle files
 *.pkl
+.venv/
