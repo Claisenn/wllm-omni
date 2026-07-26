@@ -20,33 +20,38 @@ class ARTextOutput:
 
 @dataclass(slots=True)
 class ARDecodeState:
-    """Mutable per-request state for stepwise (prefill + decode) generation.
+    """Per-request state for stepwise (prefill + KV-cache decode) generation.
 
-    ``cache`` and ``attention_mask`` are backend-specific (for
-    TransformersARPipeline: a transformers ``Cache``/``past_key_values``
-    object and the growing attention mask tensor). Executors only ever read
-    ``finished``; everything else is opaque and owned by the pipeline that
-    produced it.
+    Produced by ``ARPipeline.prefill`` and threaded through ``decode_step``
+    until ``finished`` is True, then turned into an ``ARTextOutput`` by
+    ``finalize``. Executors only ever read ``finished``; every other field is
+    owned by the pipeline that produced the state. For
+    ``TransformersARPipeline`` the ``Any`` fields hold torch tensors, a
+    transformers KV ``Cache``, and the ``LogitsProcessorList`` /
+    ``StoppingCriteriaList`` built by transformers' own generation machinery
+    at prefill time (built once, reused every step).
     """
 
     request_id: str
+    prompt: str
     input_length: int
-    generated_ids: list[int] = field(default_factory=list)
-    finished: bool = False
+    input_ids: Any
+    attention_mask: Any
+    logits_processor: Any
+    stopping_criteria: Any
     cache: Any = None
-    attention_mask: Any = None
-    metadata: dict[str, Any] = field(default_factory=dict)
+    finished: bool = False
 
 
 class ARPipeline(ABC):
     """Text-generation stage interface for mini-Omni composition.
 
-    ``generate`` is the only required method: it runs a request to
-    completion in one call. Pipelines that can decode incrementally (KV
-    cache) may additionally implement ``prefill``/``decode_step`` so
-    ARExecutor can drive them one step at a time instead of blocking on a
-    single monolithic call; see
-    ``wllm_omni.models.ar_executor.AR_STEP_EXECUTION_METHODS``.
+    ``generate`` is the only required method: run one request to completion.
+    Pipelines that can decode incrementally may additionally implement the
+    stepwise contract -- ``prefill`` / ``decode_step`` / ``finalize`` (see
+    ``wllm_omni.models.ar_executor.AR_STEP_EXECUTION_METHODS``) -- so that
+    ARExecutor can advance one decode step per ``forward()`` call instead of
+    blocking on a single monolithic call.
     """
 
     @abstractmethod
@@ -87,7 +92,18 @@ class IdentityARPipeline(ARPipeline):
 
 
 class TransformersARPipeline(ARPipeline):
-    """Minimal local Transformers CausalLM backend for the AR stage."""
+    """Local Transformers CausalLM backend with explicit prefill/decode split.
+
+    The stepwise loop must be bit-identical to
+    ``model.generate(do_sample=False, max_new_tokens=..., pad_token_id=...)``.
+    To guarantee that, ``prefill`` builds the logits processors and stopping
+    criteria through transformers' own ``_prepare_generation_config`` /
+    ``_get_logits_processor`` / ``_get_stopping_criteria`` -- so checkpoint
+    generation_config settings such as ``repetition_penalty``,
+    ``no_repeat_ngram_size``, ``min_new_tokens``, and multi-token
+    ``eos_token_id`` lists behave exactly as they do under ``generate()``
+    instead of being re-implemented (and drifting) here.
+    """
 
     def __init__(
         self,
@@ -115,11 +131,11 @@ class TransformersARPipeline(ARPipeline):
         self.model.eval()
 
     def generate(self, request: OmniRequest) -> ARTextOutput:
-        """Run a request to completion by driving the stepwise decode loop.
+        """Run one request to completion via the stepwise primitives.
 
-        Kept as the ``ARPipeline`` fallback entry point (and for direct/manual
-        use); ARExecutor normally calls ``prefill``/``decode_step`` directly
-        so it can interleave steps across requests instead of blocking here.
+        Kept as the required ``ARPipeline`` entry point for direct use;
+        ARExecutor calls ``prefill``/``decode_step``/``finalize`` itself so it
+        can advance one step per ``forward()`` call.
         """
         state = self.prefill(request)
         while not state.finished:
@@ -127,99 +143,120 @@ class TransformersARPipeline(ARPipeline):
         return self.finalize(state)
 
     def prefill(self, request: OmniRequest) -> ARDecodeState:
+        """Tokenize, run the full-prompt forward, and emit the first token."""
         import torch
+        from transformers.generation import LogitsProcessorList, StoppingCriteriaList
 
         prompt = self._build_prompt(request.prompt)
         inputs = self._tokenize_prompt(prompt)
-        input_length = int(inputs.input_ids.shape[-1])
-        with torch.no_grad():
-            out = self.model(
-                input_ids=inputs.input_ids,
-                attention_mask=inputs.get("attention_mask"),
-                use_cache=True,
-            )
-        next_id = int(torch.argmax(out.logits[:, -1, :], dim=-1))
+        input_ids = inputs.input_ids
+        attention_mask = inputs.get("attention_mask")
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+        input_length = int(input_ids.shape[-1])
+
+        # Build the exact processor/criteria stack model.generate() would use
+        # for the equivalent call. _prepare_generation_config also validates
+        # arguments (e.g. rejects max_new_tokens<=0) exactly like generate().
+        generation_config, _ = self.model._prepare_generation_config(
+            None,
+            max_new_tokens=self.max_new_tokens,
+            do_sample=False,
+            pad_token_id=self.tokenizer.eos_token_id,
+        )
+        generation_config.max_length = input_length + self.max_new_tokens
+        self.model._prepare_special_tokens(
+            generation_config,
+            kwargs_has_attention_mask=True,
+            device=input_ids.device,
+            batch_size=int(input_ids.shape[0]),
+        )
+        logits_processor = self.model._get_logits_processor(
+            generation_config,
+            input_ids_seq_length=input_length,
+            encoder_input_ids=None,
+            prefix_allowed_tokens_fn=None,
+            logits_processor=LogitsProcessorList(),
+            device=input_ids.device,
+        )
+        stopping_criteria = self.model._get_stopping_criteria(generation_config, StoppingCriteriaList())
+
         state = ARDecodeState(
             request_id=request.request_id,
+            prompt=request.prompt,
             input_length=input_length,
-            generated_ids=[next_id],
-            cache=out.past_key_values,
-            attention_mask=inputs.get("attention_mask"),
-            metadata={"prompt": request.prompt},
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            logits_processor=logits_processor,
+            stopping_criteria=stopping_criteria,
         )
-        state.finished = self._is_stopping(state)
-        return state
+        return self._step(state)
 
     def decode_step(self, state: ARDecodeState) -> ARDecodeState:
-        import torch
-
+        """Advance one token using the KV cache built by prefill."""
         if state.finished:
             return state
-        last_id = state.generated_ids[-1]
-        next_input_ids = torch.tensor([[last_id]], device=self.device)
-        attention_mask = state.attention_mask
-        if attention_mask is not None:
-            attention_mask = torch.cat(
-                [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1
-            )
-        with torch.no_grad():
-            out = self.model(
-                input_ids=next_input_ids,
-                attention_mask=attention_mask,
-                past_key_values=state.cache,
-                use_cache=True,
-            )
-        next_id = int(torch.argmax(out.logits[:, -1, :], dim=-1))
-        state.generated_ids.append(next_id)
-        state.cache = out.past_key_values
-        state.attention_mask = attention_mask
-        state.finished = self._is_stopping(state)
-        return state
+        return self._step(state)
 
     def finalize(self, state: ARDecodeState) -> ARTextOutput:
-        generated_ids = state.generated_ids
-        if generated_ids and generated_ids[-1] in self._stop_token_ids():
-            generated_ids = generated_ids[:-1]
+        """Decode the generated ids into the stage output.
+
+        Matches the old ``model.generate()``-based path exactly: ``token_ids``
+        keep a trailing stop token if one was generated (generate() includes
+        it in the returned sequence); only ``text`` drops it, via
+        ``skip_special_tokens``.
+        """
+        generated_ids = state.input_ids[0, state.input_length:]
         text = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
         if not text:
-            text = state.metadata.get("prompt", "").strip()
-        tokens = self.tokenizer.convert_ids_to_tokens(generated_ids)
+            text = state.prompt.strip()
+        token_ids = [int(item) for item in generated_ids.detach().cpu().tolist()]
+        tokens = self.tokenizer.convert_ids_to_tokens(token_ids)
         return ARTextOutput(
             request_id=state.request_id,
             text=text,
             tokens=tokens,
-            token_ids=list(generated_ids),
+            token_ids=token_ids,
             metadata={
                 "mode": "transformers_causal_lm",
                 "model": self.model_path,
                 "input_tokens": state.input_length,
-                "token_count": len(generated_ids),
+                "token_count": len(token_ids),
             },
         )
 
-    def _is_stopping(self, state: ARDecodeState) -> bool:
-        if state.generated_ids[-1] in self._stop_token_ids():
-            return True
-        return len(state.generated_ids) >= self.max_new_tokens
+    def _step(self, state: ARDecodeState) -> ARDecodeState:
+        """One model forward + logits processors + argmax + stop check.
 
-    def _stop_token_ids(self) -> set[int]:
-        """Every token id that should end generation.
-
-        Mirrors what ``model.generate()`` treats as EOS: the checkpoint's
-        ``generation_config.eos_token_id`` (which some chat models declare as
-        a list of multiple stop tokens, e.g. a dedicated turn-end token in
-        addition to the tokenizer's own EOS) as well as the tokenizer's own
-        ``eos_token_id``.
+        Mirrors one iteration of transformers' greedy ``_sample`` loop: the
+        last-position logits are copied to float32 before the processors run
+        (so lower-precision checkpoints tie-break identically), the processors
+        see the full sequence so far, and the stopping criteria run after the
+        token is appended -- which is why generate() includes a generated EOS
+        in its output.
         """
-        ids: set[int] = set()
-        config_eos = getattr(getattr(self.model, "generation_config", None), "eos_token_id", None)
-        if isinstance(config_eos, int):
-            ids.add(config_eos)
-        elif config_eos is not None:
-            ids.update(int(item) for item in config_eos)
-        if self.tokenizer.eos_token_id is not None:
-            ids.add(int(self.tokenizer.eos_token_id))
-        return ids
+        import torch
+
+        step_input_ids = state.input_ids if state.cache is None else state.input_ids[:, -1:]
+        with torch.no_grad():
+            out = self.model(
+                input_ids=step_input_ids,
+                attention_mask=state.attention_mask,
+                past_key_values=state.cache,
+                use_cache=True,
+            )
+        state.cache = out.past_key_values
+        logits = out.logits[:, -1, :].to(copy=True, dtype=torch.float32, device=state.input_ids.device)
+        scores = state.logits_processor(state.input_ids, logits)
+        next_token = torch.argmax(scores, dim=-1)
+        state.input_ids = torch.cat([state.input_ids, next_token[:, None]], dim=-1)
+        state.attention_mask = torch.cat(
+            [state.attention_mask, state.attention_mask.new_ones((state.attention_mask.shape[0], 1))],
+            dim=-1,
+        )
+        is_done = state.stopping_criteria(state.input_ids, scores)
+        state.finished = bool(torch.as_tensor(is_done).all())
+        return state
 
     def _tokenize_prompt(self, prompt: str):
         messages = [
