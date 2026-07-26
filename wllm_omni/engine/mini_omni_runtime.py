@@ -4,7 +4,12 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from wllm_omni.config import EngineConfig
-from wllm_omni.engine.connectors import ARToDiffusionConnector, CallableARToDiffusionConnector, StageConnector
+from wllm_omni.engine.connectors import (
+    ARToDiffusionConnector,
+    CallableARToDiffusionConnector,
+    ConnectorContext,
+    StageConnector,
+)
 from wllm_omni.engine.stage import ARStage, DiffusionStage, StageOutput
 from wllm_omni.engine.stage_graph import StageGraph
 from wllm_omni.engine.stage_scheduler import (
@@ -90,6 +95,58 @@ class MiniOmniRuntime:
             for output in leaf_outputs:
                 outputs_by_id[output.request_id] = self._diffusion_output(output)
         return [outputs_by_id[request.request_id] for request in requests]
+
+    def generate_batch_overlapped(self, requests: list[OmniRequest]) -> list[OmniOutput]:
+        """AR -> diffusion with pipeline overlap, in cooperative form.
+
+        generate_batch is a synchronous DAG walk: diffusion sees nothing until
+        the AR stage has rewritten every prompt. Here, each request is bridged
+        into the diffusion engine the moment its own AR rewrite completes, and
+        one denoise step is driven between AR rewrites. Requests therefore join
+        a denoise batch already in flight (the scheduler admits compatible
+        newcomers into the running set), and the first video starts denoising
+        while later prompts are still being rewritten.
+
+        This is the single-threaded, cooperative rendition of what SGLang-Omni
+        does with asyncio stages and stream queues: interleaving replaces
+        concurrency, but the scheduling behaviour -- mid-flight admission,
+        per-request completion -- is the real thing.
+        """
+        if not requests:
+            return []
+
+        engine = self._diffusion_engine()
+        outputs_by_id: dict[str, OmniOutput] = {}
+
+        for request in requests:
+            self.ar_stage.prepare()
+            stage_output = self.ar_stage.run(request)
+            bridged = self.connector.connect(
+                ConnectorContext(
+                    root_request=request,
+                    source_node=self.ar_stage.name,
+                    target_node=self.diffusion_stage.name,
+                    source_output=stage_output,
+                )
+            )
+            engine.submit(bridged)
+            # Overlap: advance the in-flight denoise work one step before the
+            # next AR rewrite, instead of letting it sit idle.
+            for output in engine.step():
+                outputs_by_id[output.request_id] = output
+
+        while engine.has_work():
+            for output in engine.step():
+                outputs_by_id[output.request_id] = output
+
+        missing = [request.request_id for request in requests if request.request_id not in outputs_by_id]
+        if missing:
+            raise RuntimeError(f"Overlapped pipeline finished without output for requests: {missing}.")
+        return [outputs_by_id[request.request_id] for request in requests]
+
+    def _diffusion_engine(self):
+        self.diffusion_stage.prepare()
+        return self.diffusion_stage.engine
 
     def _build_default_graph(self) -> StageGraph:
         graph = StageGraph()
