@@ -40,18 +40,24 @@ class BaseScheduler(SchedulerInterface):
             sampling_params_key=self._build_sampling_params_key(request),
         )
 
-    @staticmethod
-    def _build_sampling_params_key(request: OmniRequest) -> StepBatchSamplingParamsKey:
-        return StepBatchSamplingParamsKey.from_sampling_params(request.sampling_params)
+    def _build_sampling_params_key(self, request: OmniRequest) -> StepBatchSamplingParamsKey | None:
+        """Batch-compatibility key for this scheduler, or None for no constraint.
+
+        The base scheduler imposes none: whether two requests may run together
+        is a property of how a paradigm batches, not of queueing. Subclasses
+        serving a paradigm with a homogeneous-batch requirement override this.
+        """
+        return None
 
     def _can_schedule_waiting(self, state: SchedulerRequestState) -> bool:
         """Admit a waiting request only if it can share a batch with the running set.
 
         Homogeneous batching: rather than padding heterogeneous requests to a
         common shape, the scheduler only groups requests that are already
-        compatible and leaves the rest queued for a later batch.
+        compatible and leaves the rest queued for a later batch. A scheduler
+        that returns no key from _build_sampling_params_key opts out entirely.
         """
-        if not self._running:
+        if not self._running or state.sampling_params_key is None:
             return True
         current_key = self._current_sampling_params_key()
         return current_key is not None and current_key == state.sampling_params_key

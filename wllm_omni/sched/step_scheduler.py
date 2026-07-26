@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from wllm_omni.request import OmniRequest
 from wllm_omni.sched.base_scheduler import BaseScheduler
-from wllm_omni.sched.interface import RequestStatus, SchedulerOutput
+from wllm_omni.sched.interface import RequestStatus, SchedulerOutput, StepBatchSamplingParamsKey
 from wllm_omni.worker.utils import RunnerBatchOutput, RunnerOutput
 
 
@@ -19,6 +19,15 @@ class StepScheduler(BaseScheduler):
     def __init__(self, max_num_running_reqs: int = 1):
         super().__init__(max_num_running_reqs=max_num_running_reqs)
         self._request_progress: dict[str, _StepProgress] = {}
+
+    def _build_sampling_params_key(self, request: OmniRequest) -> StepBatchSamplingParamsKey:
+        """Diffusion denoise steps batch homogeneously, so requests must agree.
+
+        This lives here rather than on BaseScheduler because it is a diffusion
+        property: the AR scheduler shares the same base class and must not be
+        gated on diffusion sampling parameters.
+        """
+        return StepBatchSamplingParamsKey.from_sampling_params(request.sampling_params)
 
     def add_request(self, request: OmniRequest) -> str:
         sched_req_id = self._make_sched_req_id(request)

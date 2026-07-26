@@ -182,3 +182,46 @@ class TestExecutorGrouping:
 
         assert sorted(len(group) for group in groups) == [1, 2]
         assert all(state.paradigm is ModelParadigm.DIFFUSION for group in groups for state in group)
+
+
+class TestSchedulerSeamWithAR:
+    """The AR and diffusion schedulers share BaseScheduler.
+
+    Batch compatibility is a diffusion property. Putting it on the shared base
+    class silently gated AR requests on diffusion sampling parameters, so these
+    pin the boundary: StepScheduler constrains, RequestScheduler does not.
+    """
+
+    @staticmethod
+    def _ar_request(**overrides):
+        from wllm_omni.model_types import ModelParadigm
+
+        request = make_request(**overrides)
+        request.model_paradigm = ModelParadigm.AUTOREGRESSIVE
+        return request
+
+    def test_ar_scheduler_is_not_gated_on_diffusion_params(self):
+        from wllm_omni.sched.request_scheduler import RequestScheduler
+
+        scheduler = RequestScheduler(max_num_running_reqs=4)
+        scheduler.add_request(self._ar_request())
+        scheduler.add_request(self._ar_request(height=512))
+
+        out = scheduler.schedule()
+
+        assert out.num_scheduled_reqs == 2, "resolution is meaningless to the AR stage"
+        assert out.num_waiting_reqs == 0
+
+    def test_ar_scheduler_builds_no_batch_key(self):
+        from wllm_omni.sched.request_scheduler import RequestScheduler
+
+        scheduler = RequestScheduler(max_num_running_reqs=2)
+        sched_req_id = scheduler.add_request(self._ar_request())
+
+        assert scheduler.get_request_state(sched_req_id).sampling_params_key is None
+
+    def test_step_scheduler_still_builds_a_batch_key(self):
+        scheduler = StepScheduler(max_num_running_reqs=2)
+        sched_req_id = scheduler.add_request(make_request())
+
+        assert scheduler.get_request_state(sched_req_id).sampling_params_key is not None
