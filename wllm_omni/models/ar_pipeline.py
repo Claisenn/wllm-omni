@@ -45,7 +45,8 @@ class ARPipeline(ABC):
     completion in one call. Pipelines that can decode incrementally (KV
     cache) may additionally implement ``prefill``/``decode_step`` so
     ARExecutor can drive them one step at a time instead of blocking on a
-    single monolithic call; see ``wllm_omni.models.AR_STEP_EXECUTION_METHODS``.
+    single monolithic call; see
+    ``wllm_omni.models.ar_executor.AR_STEP_EXECUTION_METHODS``.
     """
 
     @abstractmethod

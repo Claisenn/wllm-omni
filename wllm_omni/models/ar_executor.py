@@ -4,8 +4,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from wllm_omni.model_types import ModelParadigm
-from wllm_omni.models import ModelExecutor
-from wllm_omni.models.ar_pipeline import ARPipeline, ARTextOutput, IdentityARPipeline
+from wllm_omni.models import ModelExecutor, supports_step_execution
+from wllm_omni.models.ar_pipeline import ARDecodeState, ARPipeline, ARTextOutput, IdentityARPipeline
 from wllm_omni.worker.utils import (
     ExecutionPhase,
     ExecutorCapability,
@@ -18,27 +18,38 @@ from wllm_omni.worker.utils import (
 if TYPE_CHECKING:
     from wllm_omni.request import OmniRequest
 
+AR_STEP_EXECUTION_METHODS = ("prefill", "decode_step")
+
 
 @dataclass(slots=True)
 class ARState:
     request: OmniRequest
+    decode: ARDecodeState | None = None
     output: ARTextOutput | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
 class ARExecutor(ModelExecutor):
-    """Minimal AR executor used by the first mini-Omni runtime.
+    """AR executor for the mini-Omni runtime.
 
-    This is intentionally a deterministic text stage, not a real LLM backend.
-    It validates the cross-stage runtime contract before KV cache, decode
-    scheduling, or streaming token generation are introduced.
+    When the configured pipeline implements the stepwise contract
+    (``prefill``/``decode_step``, e.g. TransformersARPipeline), each call to
+    ``forward`` advances exactly one decode step and the KV cache lives in
+    ``ARState.decode`` across ``ModelRunner.execute()`` calls -- the same
+    PREPARE-then-STEP shape DiffusionExecutor uses for denoise steps, just
+    driven by token count instead of a fixed step count. Pipelines that only
+    implement ``generate`` (e.g. IdentityARPipeline) still work: forward()
+    falls back to running them to completion in a single call.
     """
 
     paradigm = ModelParadigm.AUTOREGRESSIVE
-    capabilities = frozenset({ExecutorCapability.STEPWISE, ExecutorCapability.STREAMING})
+    capabilities = frozenset(
+        {ExecutorCapability.STEPWISE, ExecutorCapability.STREAMING, ExecutorCapability.KV_CACHE}
+    )
 
     def __init__(self, pipeline: ARPipeline | None = None):
         self.pipeline = pipeline or IdentityARPipeline()
+        self._stepwise = supports_step_execution(self.pipeline, AR_STEP_EXECUTION_METHODS)
 
     def init_state(self, sched_req_id: str, request: OmniRequest) -> RequestState:
         return RequestState(
@@ -55,7 +66,7 @@ class ARExecutor(ModelExecutor):
         return ForwardBatch(
             paradigm=self.paradigm,
             req_ids=[state.sched_req_id for state in states],
-            phase=ExecutionPhase.FINALIZE,
+            phase=ExecutionPhase.STEP,
             payload=[self._state_payload(state) for state in states],
         )
 
@@ -64,25 +75,33 @@ class ARExecutor(ModelExecutor):
             raise ValueError(f"ARExecutor cannot run batch for paradigm={batch.paradigm}.")
         states = self._batch_payload(batch)
         outputs: list[RunnerOutput] = []
-        ar_outputs: list[ARTextOutput] = []
-        for req_id, state in zip(batch.req_ids, states, strict=True):
-            ar_output = self.pipeline.generate(state.request)
-            state.output = ar_output
-            ar_outputs.append(ar_output)
-            outputs.append(RunnerOutput(req_id=req_id, step_index=1, finished=True))
-        return ModelForwardOutput(outputs=outputs, payload=ar_outputs)
+        for req_id, ar_state in zip(batch.req_ids, states, strict=True):
+            self._advance(ar_state)
+            step_index = len(ar_state.decode.generated_ids) if ar_state.decode is not None else 1
+            outputs.append(RunnerOutput(req_id=req_id, step_index=step_index, finished=ar_state.output is not None))
+        return ModelForwardOutput(outputs=outputs, payload=states)
+
+    def _advance(self, ar_state: ARState) -> None:
+        """Run one prefill/decode step, or the whole request in one shot for
+        pipelines that don't support stepwise decoding."""
+        if not self._stepwise:
+            ar_state.output = self.pipeline.generate(ar_state.request)
+            return
+        if ar_state.decode is None:
+            ar_state.decode = self.pipeline.prefill(ar_state.request)
+        else:
+            ar_state.decode = self.pipeline.decode_step(ar_state.decode)
+        if ar_state.decode.finished:
+            ar_state.output = self.pipeline.finalize(ar_state.decode)
 
     def update_states(self, states: list[RequestState], output: ModelForwardOutput) -> None:
-        ar_outputs = output.payload if isinstance(output.payload, list) else []
         output_by_req_id = {item.req_id: item for item in output.outputs}
-        ar_by_request_id = {item.request_id: item for item in ar_outputs if isinstance(item, ARTextOutput)}
         for state in states:
             item = output_by_req_id.get(state.sched_req_id)
             if item is None:
                 continue
-            payload = self._state_payload(state)
-            payload.output = ar_by_request_id.get(state.req_id)
-            state.step_index = item.step_index or 1
+            state.initialized = True
+            state.step_index = item.step_index or state.step_index
             state.error = item.error
             state.finished = item.finished
 
