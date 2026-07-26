@@ -25,6 +25,14 @@ class StageSchedulerResult:
     final_outputs: list[StageOutput]
 
 
+@dataclass(slots=True)
+class StageBatchSchedulerResult:
+    root_request_ids: list[str]
+    records: list[StageExecutionRecord]
+    # One list of per-request outputs per leaf node, in graph leaf order.
+    final_outputs: list[list[StageOutput]]
+
+
 class StageScheduler:
     """Executes a StageGraph in dependency order.
 
@@ -69,6 +77,114 @@ class StageScheduler:
             outputs=outputs,
             records=records,
             final_outputs=final_outputs,
+        )
+
+    def run_batch(self, root_requests: list[OmniRequest]) -> StageBatchSchedulerResult:
+        """Execute the stage graph for several requests together.
+
+        The DAG walk is identical to run(); what changes is the unit handed to
+        each stage. Every ready node receives the full request list via
+        run_batch, so a stage that can batch (diffusion) sees all requests in
+        one call, while stages that cannot (AR) fall back to a loop. Connectors
+        stay per-request: the i-th downstream request is built from the i-th
+        upstream output.
+        """
+        if not root_requests:
+            raise ValueError("run_batch requires at least one root request.")
+
+        records: list[StageExecutionRecord] = []
+        completed: set[str] = set()
+        scheduled: set[str] = set()
+        requests: dict[str, list[OmniRequest]] = {}
+        outputs: dict[str, list[StageOutput]] = {}
+
+        for root in self.graph.roots():
+            requests[root.node_id] = list(root_requests)
+
+        while len(completed) < len(self.graph.nodes):
+            ready_nodes = self.graph.ready_nodes(completed=completed, scheduled=scheduled)
+            if not ready_nodes:
+                remaining = sorted(set(self.graph.nodes) - completed)
+                raise RuntimeError(f"StageGraph stalled; remaining nodes: {remaining}")
+
+            for node in ready_nodes:
+                scheduled.add(node.node_id)
+                node_requests = self._requests_for_node_batch(node, root_requests, requests, outputs)
+                prepare_metadata = node.stage.prepare()
+                start = perf_counter()
+                node_outputs = node.stage.run_batch(node_requests)
+                elapsed_s = perf_counter() - start
+                if len(node_outputs) != len(node_requests):
+                    raise RuntimeError(
+                        f"Stage {node.node_id!r} returned {len(node_outputs)} outputs "
+                        f"for {len(node_requests)} requests."
+                    )
+                for request, output in zip(node_requests, node_outputs, strict=True):
+                    if prepare_metadata:
+                        output.metadata.update(prepare_metadata)
+                    records.append(self._make_batch_record(node, output, elapsed_s, len(node_requests)))
+                outputs[node.node_id] = node_outputs
+                completed.add(node.node_id)
+
+        return StageBatchSchedulerResult(
+            root_request_ids=[request.request_id for request in root_requests],
+            records=records,
+            final_outputs=[outputs[node.node_id] for node in self.graph.leaves()],
+        )
+
+    def _requests_for_node_batch(
+        self,
+        node: StageNode,
+        root_requests: list[OmniRequest],
+        requests: dict[str, list[OmniRequest]],
+        outputs: dict[str, list[StageOutput]],
+    ) -> list[OmniRequest]:
+        if node.node_id in requests:
+            return requests[node.node_id]
+
+        in_edges = self.graph.in_edges(node.node_id)
+        if len(in_edges) != 1:
+            raise RuntimeError(
+                f"Stage node {node.node_id!r} requires exactly one input edge in V1, got {len(in_edges)}."
+            )
+        edge = in_edges[0]
+        source_outputs = outputs[edge.source]
+        node_requests = [
+            edge.connector.connect(
+                ConnectorContext(
+                    root_request=root_request,
+                    source_node=edge.source,
+                    target_node=edge.target,
+                    source_output=source_output,
+                )
+            )
+            for root_request, source_output in zip(root_requests, source_outputs, strict=True)
+        ]
+        requests[node.node_id] = node_requests
+        return node_requests
+
+    def _make_batch_record(
+        self,
+        node: StageNode,
+        output: StageOutput,
+        elapsed_s: float,
+        batch_size: int,
+    ) -> StageExecutionRecord:
+        metadata = dict(output.metadata)
+        # The stage ran once for the whole batch, so per-request wall time is
+        # not observable; record the batch-level figure on every request.
+        metadata["elapsed_s"] = elapsed_s
+        metadata["batch_size"] = batch_size
+        metadata["paradigm"] = node.stage.paradigm.value
+        in_edges = self.graph.in_edges(node.node_id)
+        if in_edges:
+            metadata.setdefault("source_node", in_edges[0].source)
+            metadata.setdefault("source_request_id", output.request_id)
+        return StageExecutionRecord(
+            node_id=node.node_id,
+            stage_name=node.stage.name,
+            request_id=output.request_id,
+            metadata=metadata,
         )
 
     def _request_for_node(

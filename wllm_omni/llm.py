@@ -52,5 +52,24 @@ class OmniLLM:
             raise RuntimeError("Generation finished without output. Check runner or scheduler logs for the failing step.")
         return outputs[0]
 
+    def generate_batch(self, requests: list[OmniRequest]) -> list[OmniOutput]:
+        """Generate several videos in one call, in request order.
+
+        With mini-omni enabled this runs the whole batch through the
+        AR -> diffusion stage pipeline; otherwise it submits all requests to
+        the diffusion engine directly. Either way, requests with compatible
+        sampling parameters share denoise-step batches.
+        """
+        if not requests:
+            return []
+        if hasattr(self.engine, "generate_batch"):
+            return self.engine.generate_batch(requests)
+        outputs = self.engine.generate(list(requests))
+        outputs_by_id = {output.request_id: output for output in outputs}
+        missing = [request.request_id for request in requests if request.request_id not in outputs_by_id]
+        if missing:
+            raise RuntimeError(f"Generation finished without output for requests: {missing}.")
+        return [outputs_by_id[request.request_id] for request in requests]
+
     def save(self, output: OmniOutput, output_path: str | Path):
         save_video(output.frames, output_path, output.fps)

@@ -7,7 +7,12 @@ from wllm_omni.config import EngineConfig
 from wllm_omni.engine.connectors import ARToDiffusionConnector, CallableARToDiffusionConnector, StageConnector
 from wllm_omni.engine.stage import ARStage, DiffusionStage, StageOutput
 from wllm_omni.engine.stage_graph import StageGraph
-from wllm_omni.engine.stage_scheduler import StageExecutionRecord, StageScheduler, StageSchedulerResult
+from wllm_omni.engine.stage_scheduler import (
+    StageBatchSchedulerResult,
+    StageExecutionRecord,
+    StageScheduler,
+    StageSchedulerResult,
+)
 from wllm_omni.model_types import ModelParadigm
 from wllm_omni.models.ar_pipeline import ARPipeline, ARTextOutput
 from wllm_omni.outputs import OmniOutput
@@ -71,6 +76,21 @@ class MiniOmniRuntime:
         self.last_trace = self._make_trace(result)
         return [self._diffusion_output(output) for output in result.final_outputs]
 
+    def generate_batch(self, requests: list[OmniRequest]) -> list[OmniOutput]:
+        """Run several multimodal requests through the AR -> diffusion pipeline.
+
+        The AR stage rewrites each prompt in turn; the diffusion stage then
+        receives all bridged requests in one call, so compatible ones share a
+        single denoise loop. Outputs are returned in request order.
+        """
+        result = self.stage_scheduler.run_batch(requests)
+        self.last_trace = self._make_batch_trace(result)
+        outputs_by_id: dict[str, OmniOutput] = {}
+        for leaf_outputs in result.final_outputs:
+            for output in leaf_outputs:
+                outputs_by_id[output.request_id] = self._diffusion_output(output)
+        return [outputs_by_id[request.request_id] for request in requests]
+
     def _build_default_graph(self) -> StageGraph:
         graph = StageGraph()
         graph.add_node("ar.prompt_bridge", self.ar_stage)
@@ -91,6 +111,15 @@ class MiniOmniRuntime:
     def _make_trace(self, result: StageSchedulerResult) -> MiniOmniTrace:
         return MiniOmniTrace(
             request_id=result.root_request_id,
+            stages=[self._make_stage_record_from_record(record) for record in result.records],
+            graph_nodes=[record.node_id for record in result.records],
+        )
+
+    def _make_batch_trace(self, result: StageBatchSchedulerResult) -> MiniOmniTrace:
+        # One trace covering the whole batch; records carry their request_id,
+        # so per-request views can be filtered out of it.
+        return MiniOmniTrace(
+            request_id=",".join(result.root_request_ids),
             stages=[self._make_stage_record_from_record(record) for record in result.records],
             graph_nodes=[record.node_id for record in result.records],
         )

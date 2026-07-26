@@ -32,6 +32,16 @@ class Stage(ABC):
     def run(self, request: OmniRequest) -> StageOutput:
         pass
 
+    def run_batch(self, requests: list[OmniRequest]) -> list[StageOutput]:
+        """Run several requests through this stage.
+
+        The default is a per-request loop, which is correct for any stage. A
+        stage whose engine can exploit request-level batching (the diffusion
+        stage: compatible requests share one denoise-step forward) overrides
+        this to hand the whole set over at once.
+        """
+        return [self.run(request) for request in requests]
+
 
 class ARStage(Stage):
     name = "ar.prompt_bridge"
@@ -80,6 +90,31 @@ class DiffusionStage(Stage):
                 "bridge": "ar_text_to_diffusion_prompt",
             },
         )
+
+    def run_batch(self, requests: list[OmniRequest]) -> list[StageOutput]:
+        """Submit all requests to the diffusion engine in one call.
+
+        This is where the omni pipeline meets denoise-step batching: the
+        engine's scheduler admits every compatible request into one running
+        set, so N videos cost one denoise loop instead of N. The engine
+        reports completions in finish order; outputs are matched back to
+        requests by request_id.
+        """
+        outputs = self._engine().generate(list(requests))
+        outputs_by_id = {output.request_id: output for output in outputs}
+        missing = [request.request_id for request in requests if request.request_id not in outputs_by_id]
+        if missing:
+            raise RuntimeError(f"Diffusion stage finished without output for requests: {missing}.")
+        return [
+            StageOutput(
+                request_id=request.request_id,
+                data=outputs_by_id[request.request_id],
+                metadata={
+                    "bridge": "ar_text_to_diffusion_prompt",
+                },
+            )
+            for request in requests
+        ]
 
     def _engine(self) -> DiffusionEngine:
         if self.engine is None:
