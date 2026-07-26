@@ -54,20 +54,40 @@ class ModelExecutor(ABC):
     def forward(self, batch: ForwardBatch) -> ModelForwardOutput:
         pass
 
-    @abstractmethod
     def update_states(self, states: list[RequestState], output: ModelForwardOutput) -> None:
-        pass
+        """Write forward results back into the runner-owned request states.
 
-    @abstractmethod
+        Progress must round-trip through ``ModelForwardOutput.payload`` (not
+        rely on states aliasing the batch payload) so executors survive a
+        worker/serialization boundary. Both current executors share this exact
+        logic; override only if a model family needs different bookkeeping.
+        """
+        output_by_req_id = {item.req_id: item for item in output.outputs}
+        for state in states:
+            item = output_by_req_id.get(state.sched_req_id)
+            if item is None:
+                continue
+            if output.payload is not None:
+                state.payload = output.payload
+                state.initialized = True
+            if item.error is not None:
+                state.error = item.error
+                state.finished = True
+            if item.step_index is not None:
+                state.step_index = item.step_index
+            if item.finished:
+                state.finished = True
+
     def collect_outputs(
         self,
         states: list[RequestState],
         output: ModelForwardOutput,
     ) -> list[RunnerOutput]:
-        pass
+        """Default: forward() already attached results to its RunnerOutputs."""
+        return output.outputs
 
     def release(self, state: RequestState) -> None:
-        pass
+        state.payload = None
 
 
 class ExecutorRegistry:

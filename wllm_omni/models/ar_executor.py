@@ -129,36 +129,7 @@ class ARExecutor(ModelExecutor):
         )
         return ModelForwardOutput(outputs=[runner_output], payload=ar_state)
 
-    def update_states(self, states: list[RequestState], output: ModelForwardOutput) -> None:
-        output_by_req_id = {item.req_id: item for item in output.outputs}
-        for state in states:
-            item = output_by_req_id.get(state.sched_req_id)
-            if item is None:
-                continue
-            if output.payload is not None:
-                # Progress must round-trip through the forward output, not
-                # rely on state.payload aliasing the batch payload -- same
-                # contract DiffusionExecutor honors for worker boundaries.
-                state.payload = output.payload
-                state.initialized = True
-            if item.error is not None:
-                state.error = item.error
-                state.finished = True
-            if item.step_index is not None:
-                state.step_index = item.step_index
-            if item.finished:
-                state.finished = True
-
-    def collect_outputs(
-        self,
-        states: list[RequestState],
-        output: ModelForwardOutput,
-    ) -> list[RunnerOutput]:
-        # forward() already attached result to the finishing RunnerOutput.
-        return output.outputs
-
-    def release(self, state: RequestState) -> None:
-        state.payload = None
+    # update_states / collect_outputs / release use the ModelExecutor defaults.
 
     @staticmethod
     def _state_payload(state: RequestState) -> ARState:

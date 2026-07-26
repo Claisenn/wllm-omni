@@ -128,32 +128,7 @@ class DiffusionExecutor(ModelExecutor):
             self._emit_profile(payload)
         return output
 
-    def update_states(self, states: list[RequestState], output: ModelForwardOutput) -> None:
-        output_by_req_id = {item.req_id: item for item in output.outputs}
-        for state in states:
-            item = output_by_req_id.get(state.sched_req_id)
-            if item is None:
-                continue
-            if output.payload is not None:
-                state.payload = output.payload
-                state.initialized = True
-            if item.error is not None:
-                state.error = item.error
-                state.finished = True
-            if item.step_index is not None:
-                state.step_index = item.step_index
-            if item.finished:
-                state.finished = True
-
-    def collect_outputs(
-        self,
-        states: list[RequestState],
-        output: ModelForwardOutput,
-    ) -> list[RunnerOutput]:
-        return output.outputs
-
-    def release(self, state: RequestState) -> None:
-        state.payload = None
+    # update_states / collect_outputs / release use the ModelExecutor defaults.
 
     @staticmethod
     def _payload(state: RequestState) -> RunnerState:
