@@ -19,14 +19,14 @@
 - 独立 `Connector`
 - 统一 `ModelRunner`
 - 差异化 `ARExecutor` / `DiffusionExecutor`
+- AR prefill / decode 分离 + KV cache（`TransformersARPipeline.prefill`/`decode_step`，`ARExecutor` 每次
+  `forward()` 只推进一步，与 `DiffusionExecutor` 的 PREPARE/STEP 节奏一致）
 
 还没有支持：
 
 - 动态多分支 `StageGraph`
 - stage-level batching
-- AR prefill / decode 分离
-- KV cache
-- streaming token 输出
+- streaming token 输出（单步解码已就位，但结果仍在整段生成完成后一次性返回）
 - 多 session 调度
 - pipeline overlap
 - 多 GPU / 分布式 stage serving
