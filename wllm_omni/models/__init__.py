@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Sequence
 
 from wllm_omni.model_types import ModelParadigm
 from wllm_omni.worker.utils import (
@@ -18,8 +18,13 @@ if TYPE_CHECKING:
 STEP_EXECUTION_METHODS = ("prepare_encode", "denoise_step", "step_scheduler", "post_decode")
 
 
-def supports_step_execution(pipeline: Any) -> bool:
-    return all(callable(getattr(pipeline, name, None)) for name in STEP_EXECUTION_METHODS)
+def supports_step_execution(pipeline: Any, methods: Sequence[str] = STEP_EXECUTION_METHODS) -> bool:
+    """Duck-type check for whether a pipeline implements a step-execution contract.
+
+    Defaults to the diffusion contract so existing call sites are unaffected;
+    other paradigms (e.g. AR prefill/decode) pass their own ``methods`` tuple.
+    """
+    return all(callable(getattr(pipeline, name, None)) for name in methods)
 
 
 class ModelExecutor(ABC):
