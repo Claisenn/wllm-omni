@@ -38,6 +38,10 @@ class EngineConfig:
     image_cache_size: int = 4
     condition_cache_size: int = 4
     enable_profiling: bool = False
+    # Merge the CFG cond/uncond branches into one 2N-row transformer forward.
+    # Halves kernel launches per denoise step at the cost of doubled activation
+    # memory; interacts badly with cpu offload, so it is opt-in.
+    cfg_batched: bool = False
     probe_condition_cache: bool = False
     enable_mini_omni: bool = False
     ar_model: str | None = None

@@ -14,6 +14,7 @@ from wllm_omni.config import EngineConfig
 from wllm_omni.outputs import OmniOutput
 from wllm_omni.profiler import RequestProfiler
 from wllm_omni.utils import resize_with_aspect
+from wllm_omni.worker.cfg import merge_cfg_rows, split_cfg_rows
 from wllm_omni.worker.input_batch import StepInputBatch
 from wllm_omni.worker.utils import RunnerState
 
@@ -538,6 +539,30 @@ class Wan22I2VPipeline:
         anchor = batch.states[0]
         with self.profile_stage(anchor, "denoise.prepare_inputs"):
             inputs = self._prepare_denoise_inputs(batch)
+
+        use_batched_cfg = (
+            self.config.cfg_batched and inputs.guidance_scale > 1.0 and inputs.negative_prompt_embeds is not None
+        )
+        if use_batched_cfg:
+            # One 2N-row forward serves both CFG branches; see worker/cfg.py
+            # for the trade-off. Default path below is untouched.
+            with self.profile_stage(anchor, "denoise.transformer_cfg_batched"):
+                hidden, timesteps, encoder = merge_cfg_rows(
+                    inputs.latent_model_input,
+                    inputs.timestep,
+                    inputs.prompt_embeds,
+                    inputs.negative_prompt_embeds,
+                )
+                with self.pipe.transformer.cache_context("cfg_batched"):
+                    merged = self.pipe.transformer(
+                        hidden_states=hidden,
+                        timestep=timesteps,
+                        encoder_hidden_states=encoder,
+                        return_dict=False,
+                    )[0]
+                noise_pred, noise_uncond = split_cfg_rows(merged, inputs.latent_model_input.shape[0])
+            with self.profile_stage(anchor, "denoise.cfg_combine"):
+                return self._apply_classifier_free_guidance(noise_pred, noise_uncond, inputs.guidance_scale)
 
         with self.profile_stage(anchor, "denoise.transformer_cond"):
             noise_pred = self._run_transformer_forward(inputs, inputs.prompt_embeds, "cond")

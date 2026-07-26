@@ -19,6 +19,11 @@ def parse_args():
     parser.add_argument("--max-num-seqs", type=int, default=2)
     parser.add_argument("--profile", action="store_true", help="Print a per-request diffusion profiler summary.")
     parser.add_argument(
+        "--cfg-batched",
+        action="store_true",
+        help="Merge CFG cond/uncond into one transformer forward (doubles activation memory).",
+    )
+    parser.add_argument(
         "--vae-dtype",
         choices=["fp32", "bf16"],
         default="fp32",
@@ -113,6 +118,7 @@ def main():
         use_cpu_offload=not args.disable_cpu_offload,
         max_num_seqs=args.max_num_seqs,
         enable_profiling=args.profile,
+        cfg_batched=args.cfg_batched,
         vae_dtype=_parse_vae_dtype(args.vae_dtype),
         probe_condition_cache=args.probe_condition_cache,
         enable_mini_omni=args.mini_omni,
