@@ -21,6 +21,9 @@
 - 差异化 `ARExecutor` / `DiffusionExecutor`
 - AR prefill / decode 分离 + KV cache（`TransformersARPipeline.prefill`/`decode_step`，`ARExecutor` 每次
   `forward()` 只推进一步，与 `DiffusionExecutor` 的 PREPARE/STEP 节奏一致）
+- MLA 架构 AR 后端验证（将 `ar_model` 指向 DeepSeek 系 checkpoint 即可切换；stepwise 解码在
+  DeepseekV3 上与 `generate()` 位级一致。注意：transformers 的 DeepSeek 实现在 cache 中存放解压后的
+  逐头 K/V 而非压缩 latent，MLA 的省显存优势尚未兑现——这是未来接入 FlashMLA 类 kernel 的空间）
 
 还没有支持：
 
