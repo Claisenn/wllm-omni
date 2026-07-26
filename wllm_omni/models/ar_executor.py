@@ -114,7 +114,7 @@ class ARExecutor(ModelExecutor):
                 raise ValueError("ARExecutor got a STEP batch without prefilled decode state.")
             ar_state.decode = self.pipeline.decode_step(ar_state.decode)
 
-        if ar_state.output is None and ar_state.decode is not None and ar_state.decode.finished:
+        if ar_state.output is None and ar_state.decode.finished:
             ar_state.output = self.pipeline.finalize(ar_state.decode)
             # The KV cache is dead weight once the output exists; drop it now
             # instead of keeping it alive until release().
