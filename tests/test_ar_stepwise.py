@@ -468,3 +468,13 @@ def test_two_concurrent_requests_interleave_decode_steps():
     assert pipeline.prefill_calls == 2
     assert pipeline.decode_step_calls == 4
     assert not runner.state_cache
+
+
+def test_stepwise_matches_generate_without_logits_to_keep_support():
+    """Models whose forward() lacks logits_to_keep (possible with
+    trust_remote_code) must fall back to full logits, exactly as generate()
+    gates the kwarg on _supports_logits_to_keep()."""
+    pipeline = _make_pipeline()
+    reference = _reference_generate(pipeline)
+    pipeline.model._supports_logits_to_keep = lambda: False
+    assert _stepwise_output(pipeline).token_ids == reference

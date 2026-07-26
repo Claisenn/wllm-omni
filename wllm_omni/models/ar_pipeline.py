@@ -243,18 +243,23 @@ class TransformersARPipeline(ARPipeline):
         import torch
 
         step_input_ids = state.input_ids if state.cache is None else state.input_ids[:, -1:]
+        # logits_to_keep=1 matches generate(): the lm_head runs only on the
+        # last position. Beyond skipping O(prompt_len x vocab) prefill work,
+        # the matmul shape matters for bit-exactness -- a [1, L, H] vs
+        # [1, 1, H] head matmul can use different kernels/accumulation order
+        # on GPU and flip argmax ties in low precision. Gated exactly like
+        # generate() gates it: remote-code models may not accept the kwarg.
+        step_kwargs = {}
+        supports = getattr(self.model, "_supports_logits_to_keep", None)
+        if callable(supports) and supports():
+            step_kwargs["logits_to_keep"] = 1
         with torch.no_grad():
-            # logits_to_keep=1 matches generate(): the lm_head runs only on
-            # the last position. Beyond skipping O(prompt_len x vocab) prefill
-            # work, the matmul shape matters for bit-exactness -- a [1, L, H]
-            # vs [1, 1, H] head matmul can use different kernels/accumulation
-            # order on GPU and flip argmax ties in low precision.
             out = self.model(
                 input_ids=step_input_ids,
                 attention_mask=state.attention_mask,
                 past_key_values=state.cache,
                 use_cache=True,
-                logits_to_keep=1,
+                **step_kwargs,
             )
         state.cache = out.past_key_values
         logits = out.logits[:, -1, :].to(copy=True, dtype=torch.float32, device=state.input_ids.device)
