@@ -18,8 +18,35 @@ class ARTextOutput:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(slots=True)
+class ARDecodeState:
+    """Mutable per-request state for stepwise (prefill + decode) generation.
+
+    ``cache`` and ``attention_mask`` are backend-specific (for
+    TransformersARPipeline: a transformers ``Cache``/``past_key_values``
+    object and the growing attention mask tensor). Executors only ever read
+    ``finished``; everything else is opaque and owned by the pipeline that
+    produced it.
+    """
+
+    request_id: str
+    input_length: int
+    generated_ids: list[int] = field(default_factory=list)
+    finished: bool = False
+    cache: Any = None
+    attention_mask: Any = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
 class ARPipeline(ABC):
-    """Text-generation stage interface for mini-Omni composition."""
+    """Text-generation stage interface for mini-Omni composition.
+
+    ``generate`` is the only required method: it runs a request to
+    completion in one call. Pipelines that can decode incrementally (KV
+    cache) may additionally implement ``prefill``/``decode_step`` so
+    ARExecutor can drive them one step at a time instead of blocking on a
+    single monolithic call; see ``wllm_omni.models.AR_STEP_EXECUTION_METHODS``.
+    """
 
     @abstractmethod
     def generate(self, request: OmniRequest) -> ARTextOutput:
@@ -87,36 +114,111 @@ class TransformersARPipeline(ARPipeline):
         self.model.eval()
 
     def generate(self, request: OmniRequest) -> ARTextOutput:
+        """Run a request to completion by driving the stepwise decode loop.
+
+        Kept as the ``ARPipeline`` fallback entry point (and for direct/manual
+        use); ARExecutor normally calls ``prefill``/``decode_step`` directly
+        so it can interleave steps across requests instead of blocking here.
+        """
+        state = self.prefill(request)
+        while not state.finished:
+            state = self.decode_step(state)
+        return self.finalize(state)
+
+    def prefill(self, request: OmniRequest) -> ARDecodeState:
         import torch
 
         prompt = self._build_prompt(request.prompt)
         inputs = self._tokenize_prompt(prompt)
         input_length = int(inputs.input_ids.shape[-1])
         with torch.no_grad():
-            output_ids = self.model.generate(
-                **inputs,
-                max_new_tokens=self.max_new_tokens,
-                do_sample=False,
-                pad_token_id=self.tokenizer.eos_token_id,
+            out = self.model(
+                input_ids=inputs.input_ids,
+                attention_mask=inputs.get("attention_mask"),
+                use_cache=True,
             )
-        generated_ids = output_ids[0, input_length:]
+        next_id = int(torch.argmax(out.logits[:, -1, :], dim=-1))
+        state = ARDecodeState(
+            request_id=request.request_id,
+            input_length=input_length,
+            generated_ids=[next_id],
+            cache=out.past_key_values,
+            attention_mask=inputs.get("attention_mask"),
+            metadata={"prompt": request.prompt},
+        )
+        state.finished = self._is_stopping(state)
+        return state
+
+    def decode_step(self, state: ARDecodeState) -> ARDecodeState:
+        import torch
+
+        if state.finished:
+            return state
+        last_id = state.generated_ids[-1]
+        next_input_ids = torch.tensor([[last_id]], device=self.device)
+        attention_mask = state.attention_mask
+        if attention_mask is not None:
+            attention_mask = torch.cat(
+                [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1
+            )
+        with torch.no_grad():
+            out = self.model(
+                input_ids=next_input_ids,
+                attention_mask=attention_mask,
+                past_key_values=state.cache,
+                use_cache=True,
+            )
+        next_id = int(torch.argmax(out.logits[:, -1, :], dim=-1))
+        state.generated_ids.append(next_id)
+        state.cache = out.past_key_values
+        state.attention_mask = attention_mask
+        state.finished = self._is_stopping(state)
+        return state
+
+    def finalize(self, state: ARDecodeState) -> ARTextOutput:
+        generated_ids = state.generated_ids
+        if generated_ids and generated_ids[-1] in self._stop_token_ids():
+            generated_ids = generated_ids[:-1]
         text = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
         if not text:
-            text = request.prompt.strip()
-        token_ids = [int(item) for item in generated_ids.detach().cpu().tolist()]
-        tokens = self.tokenizer.convert_ids_to_tokens(token_ids)
+            text = state.metadata.get("prompt", "").strip()
+        tokens = self.tokenizer.convert_ids_to_tokens(generated_ids)
         return ARTextOutput(
-            request_id=request.request_id,
+            request_id=state.request_id,
             text=text,
             tokens=tokens,
-            token_ids=token_ids,
+            token_ids=list(generated_ids),
             metadata={
                 "mode": "transformers_causal_lm",
                 "model": self.model_path,
-                "input_tokens": input_length,
-                "token_count": len(token_ids),
+                "input_tokens": state.input_length,
+                "token_count": len(generated_ids),
             },
         )
+
+    def _is_stopping(self, state: ARDecodeState) -> bool:
+        if state.generated_ids[-1] in self._stop_token_ids():
+            return True
+        return len(state.generated_ids) >= self.max_new_tokens
+
+    def _stop_token_ids(self) -> set[int]:
+        """Every token id that should end generation.
+
+        Mirrors what ``model.generate()`` treats as EOS: the checkpoint's
+        ``generation_config.eos_token_id`` (which some chat models declare as
+        a list of multiple stop tokens, e.g. a dedicated turn-end token in
+        addition to the tokenizer's own EOS) as well as the tokenizer's own
+        ``eos_token_id``.
+        """
+        ids: set[int] = set()
+        config_eos = getattr(getattr(self.model, "generation_config", None), "eos_token_id", None)
+        if isinstance(config_eos, int):
+            ids.add(config_eos)
+        elif config_eos is not None:
+            ids.update(int(item) for item in config_eos)
+        if self.tokenizer.eos_token_id is not None:
+            ids.add(int(self.tokenizer.eos_token_id))
+        return ids
 
     def _tokenize_prompt(self, prompt: str):
         messages = [
