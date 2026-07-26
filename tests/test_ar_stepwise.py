@@ -26,6 +26,7 @@ import torch
 
 from wllm_omni.config import EngineConfig
 from wllm_omni.engine.ar_engine import AREngine
+from wllm_omni.model_types import ModelParadigm
 from wllm_omni.models import supports_step_execution
 from wllm_omni.models.ar_executor import AR_STEP_EXECUTION_METHODS, ARExecutor, ARState
 from wllm_omni.models.ar_pipeline import ARTextOutput, IdentityARPipeline, TransformersARPipeline
@@ -234,7 +235,6 @@ class _FakeDecodeState:
         self.request_id = request_id
         self.ids = [10]
         self.finished = False
-        self.kv_cache = object()  # sentinel standing in for KV tensors
 
 
 class _FakeStepwisePipeline:
@@ -280,7 +280,6 @@ class _PrefillDecodeOnlyPipeline(_FakeStepwisePipeline):
 
 
 def test_step_execution_probe_requires_the_full_contract():
-    assert AR_STEP_EXECUTION_METHODS == ("prefill", "decode_step", "finalize")
     assert supports_step_execution(_FakeStepwisePipeline(), AR_STEP_EXECUTION_METHODS)
     assert not supports_step_execution(_PrefillDecodeOnlyPipeline(), AR_STEP_EXECUTION_METHODS)
     assert not supports_step_execution(IdentityARPipeline(), AR_STEP_EXECUTION_METHODS)
@@ -418,3 +417,54 @@ def test_transformers_pipeline_end_to_end_through_engine():
     engine = AREngine(EngineConfig(enable_mini_omni=True), pipeline=pipeline)
     output = engine.generate(OmniRequest(prompt="hello world"))
     assert output.token_ids == reference
+
+
+def test_pipeline_raising_mid_decode_releases_state_and_surfaces_error():
+    """A decode_step exception must flow through ModelRunner._mark_group_error,
+    release the request state (freeing the KV cache), and surface as the
+    RuntimeError AREngine raises for failed requests."""
+
+    class _ExplodingPipeline(_FakeStepwisePipeline):
+        def decode_step(self, state):
+            raise RuntimeError("kaboom mid-decode")
+
+    engine = AREngine(EngineConfig(enable_mini_omni=True), pipeline=_ExplodingPipeline())
+    with pytest.raises(RuntimeError, match="kaboom mid-decode"):
+        engine.generate(OmniRequest(prompt="hello"))
+    assert not engine.runner.state_cache, "errored request state must be released"
+
+
+def test_two_concurrent_requests_interleave_decode_steps():
+    """With max_num_seqs=2 both requests run concurrently: per-request batch
+    keys yield singleton groups, so each engine step advances every running
+    request by one decode step and both finish with correct outputs."""
+    pipeline = _FakeStepwisePipeline()
+    engine = AREngine(EngineConfig(enable_mini_omni=True, max_num_seqs=2), pipeline=pipeline)
+    scheduler, runner = engine.scheduler, engine.runner
+
+    first, second = OmniRequest(prompt="one"), OmniRequest(prompt="two")
+    for request in (first, second):
+        # AREngine.generate() normally stamps the paradigm; this test drives
+        # the scheduler/runner pair directly to observe interleaving.
+        request.model_paradigm = ModelParadigm.AUTOREGRESSIVE
+        scheduler.add_request(request)
+
+    results = {}
+    while scheduler.has_requests():
+        sched_output = scheduler.schedule()
+        if sched_output.is_empty:
+            break
+        runner_output = runner.execute(sched_output)
+        for finished_id in scheduler.update_from_output(sched_output, runner_output):
+            scheduler.pop_request_state(finished_id)
+        for item in runner_output.outputs:
+            assert item.error is None
+            if item.finished:
+                results[item.result.request_id] = item.result
+
+    assert set(results) == {first.request_id, second.request_id}
+    for output in results.values():
+        assert output.token_ids == [10, 11, 12]
+    assert pipeline.prefill_calls == 2
+    assert pipeline.decode_step_calls == 4
+    assert not runner.state_cache

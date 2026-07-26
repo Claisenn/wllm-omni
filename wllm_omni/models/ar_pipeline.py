@@ -193,7 +193,12 @@ class TransformersARPipeline(ARPipeline):
         return self._step(state)
 
     def decode_step(self, state: ARDecodeState) -> ARDecodeState:
-        """Advance one token using the KV cache built by prefill."""
+        """Advance one token using the KV cache built by prefill.
+
+        The finished guard is unreachable via ARExecutor (it never STEPs a
+        finished state) and via generate(); it is kept as an idempotency
+        guard for direct callers of the public stepwise API.
+        """
         if state.finished:
             return state
         return self._step(state)
@@ -239,11 +244,17 @@ class TransformersARPipeline(ARPipeline):
 
         step_input_ids = state.input_ids if state.cache is None else state.input_ids[:, -1:]
         with torch.no_grad():
+            # logits_to_keep=1 matches generate(): the lm_head runs only on
+            # the last position. Beyond skipping O(prompt_len x vocab) prefill
+            # work, the matmul shape matters for bit-exactness -- a [1, L, H]
+            # vs [1, 1, H] head matmul can use different kernels/accumulation
+            # order on GPU and flip argmax ties in low precision.
             out = self.model(
                 input_ids=step_input_ids,
                 attention_mask=state.attention_mask,
                 past_key_values=state.cache,
                 use_cache=True,
+                logits_to_keep=1,
             )
         state.cache = out.past_key_values
         logits = out.logits[:, -1, :].to(copy=True, dtype=torch.float32, device=state.input_ids.device)
@@ -254,7 +265,9 @@ class TransformersARPipeline(ARPipeline):
             [state.attention_mask, state.attention_mask.new_ones((state.attention_mask.shape[0], 1))],
             dim=-1,
         )
-        is_done = state.stopping_criteria(state.input_ids, scores)
+        # Second arg mirrors _sample's `scores` accumulator, which is None
+        # unless output_scores is requested; standard criteria ignore it.
+        is_done = state.stopping_criteria(state.input_ids, None)
         state.finished = bool(torch.as_tensor(is_done).all())
         return state
 
